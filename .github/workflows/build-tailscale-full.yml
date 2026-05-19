@@ -43,10 +43,11 @@ jobs:
           wget -q https://codeload.github.com/tailscale/tailscale/tar.gz/v${VERSION} -O tailscale.tar.gz
           HASH=$(sha256sum tailscale.tar.gz | awk '{print $1}')
           echo "HASH=$HASH" >> $GITHUB_OUTPUT
-          echo "Tailscale 版本: $VERSION"
+          echo "=== Tailscale 信息 ==="
+          echo "版本: $VERSION"
           echo "HASH: $HASH"
 
-      - name: 创建 Tailscale Makefile（严格按你格式）
+      - name: 创建 Tailscale Makefile
         run: |
           mkdir -p package/network/tailscale/files
 
@@ -109,4 +110,84 @@ jobs:
           	$(LN) tailscaled $(1)/usr/sbin/tailscale
           	$(INSTALL_BIN) ./files/tailscale.init $(1)/etc/init.d/tailscale
           	$(INSTALL_DATA) ./files/tailscale.conf $(1)/etc/config/tailscale
-          end
+          endef
+
+          $(eval $(call BuildPackage,tailscale))
+          EOF
+
+          # 创建必要文件
+          cat > package/network/tailscale/files/tailscale.init << 'EOT'
+          #!/bin/sh /etc/rc.common
+          START=99
+          USE_PROCD=1
+          start_service() {
+              procd_open_instance
+              procd_set_param command /usr/sbin/tailscaled --state=/etc/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock --port=41641
+              procd_set_param respawn
+              procd_close_instance
+          }
+          EOT
+          chmod +x package/network/tailscale/files/tailscale.init
+
+          cat > package/network/tailscale/files/tailscale.conf << 'EOC'
+          config tailscale 'settings'
+              option enabled '0'
+              option port '41641'
+          EOC
+
+      - name: 配置编译环境
+        run: |
+          make defconfig
+          cat >> .config << EOF
+          CONFIG_TARGET_x86=y
+          CONFIG_TARGET_x86_64=y
+          CONFIG_PACKAGE_tailscale=y
+          CONFIG_PACKAGE_luci-app-tailscale-community=y
+          CONFIG_PACKAGE_luci-i18n-tailscale-community-zh-cn=y
+          EOF
+          make defconfig
+          echo "=== .config 中 tailscale 相关配置 ==="
+          grep -E "tailscale|luci-app-tailscale" .config || echo "未找到配置"
+
+      - name: 下载依赖
+        run: make -j2 download V=s || true
+
+      - name: 编译 Tailscale
+        run: |
+          echo "开始编译 tailscale..."
+          make -j$(nproc) package/tailscale/clean package/tailscale/compile V=s 2>&1 | tee tailscale.log
+          echo "=== Tailscale 编译日志尾部 ==="
+          tail -n 50 tailscale.log
+
+      - name: 编译 LuCI 界面
+        run: |
+          echo "开始编译 luci-app-tailscale-community..."
+          make -j$(nproc) package/luci-app-tailscale-community/clean package/luci-app-tailscale-community/compile V=s 2>&1 | tee luci.log
+          echo "=== LuCI 编译日志尾部 ==="
+          tail -n 30 luci.log
+
+      - name: 查找并复制 IPK 文件
+        run: |
+          mkdir -p ./output
+          echo "=== 搜索所有 tailscale ipk ==="
+          find bin/packages -name "*tailscale*.ipk" -exec ls -lh {} \;
+          find bin/packages -name "*luci-app-tailscale-community*.ipk" -exec ls -lh {} \;
+
+          cp -f bin/packages/x86_64/*tailscale*.ipk ./output/ 2>/dev/null || true
+          cp -f bin/packages/x86_64/*luci-app-tailscale-community*.ipk ./output/ 2>/dev/null || true
+
+          echo "=== 输出目录内容 ==="
+          ls -lh ./output/ || echo "output 目录为空！"
+
+          if [ ! -f ./output/tailscale*.ipk ]; then
+            echo "❌ 未找到 ipk 文件，请查看上方编译日志查找错误"
+          else
+            echo "✅ 找到 ipk 文件"
+          fi
+
+      - name: 上传 ipk 文件
+        uses: actions/upload-artifact@v4
+        with:
+          name: tailscale-x86_64-ipks
+          path: ./output/
+          retention-days: 30
