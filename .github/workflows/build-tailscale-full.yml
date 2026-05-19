@@ -36,7 +36,7 @@ jobs:
       - name: 检出 ImmortalWrt v24.10.6
         uses: actions/checkout@v4
         with:
-          repository: https://github.com/immortalwrt/immortalwrt
+          repository: immortalwrt/immortalwrt
           ref: v24.10.6
           fetch-depth: 1
 
