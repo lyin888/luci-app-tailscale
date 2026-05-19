@@ -1,0 +1,186 @@
+name: 完全编译 Tailscale + LuCI 界面 (ImmortalWrt v24.10.6)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tailscale_version:
+        description: 'Tailscale 版本 (留空自动使用最新版)'
+        required: false
+        default: ''
+      target:
+        description: '目标架构 (all = 常用架构)'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - x86_64
+          - aarch64_generic
+          - armsr_armv7
+          - armsr_aarch64
+
+jobs:
+  build:
+    name: ${{ matrix.target || '多架构' }}
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        target: 
+          - x86_64
+          # aarch64_generic
+          # 可自行取消注释其他架构
+          # - armsr_armv7
+          # - armsr_aarch64
+
+    steps:
+      - name: 检出 ImmortalWrt v24.10.6
+        uses: actions/checkout@v4
+        with:
+          repository: https://github.com/immortalwrt/immortalwrt
+          ref: v24.10.6
+          fetch-depth: 1
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ccache ecj fastjar file g++ gawk \
+            gettext git java-propose-classpath libelf-dev libncurses5-dev \
+            libncursesw5-dev libssl-dev python3 python3-pip python3-setuptools \
+            python3-dev rsync subversion swig unzip wget zlib1g-dev
+
+      - name: 更新 feeds
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 加入 luci-app-tailscale-community
+        run: |
+          rm -rf package/luci-app-tailscale-community
+          git clone --depth=1 https://github.com/Tokisaki-Galaxy/luci-app-tailscale-community.git package/luci-app-tailscale-community
+
+      - name: 获取 Tailscale 最新版本和 HASH
+        id: tailscale
+        run: |
+          if [ -z "${{ github.event.inputs.tailscale_version }}" ]; then
+            VERSION=$(curl -s https://api.github.com/repos/tailscale/tailscale/releases/latest | grep '"tag_name"' | sed -E 's/.*"v([^"]+)".*/\1/')
+          else
+            VERSION="${{ github.event.inputs.tailscale_version }}"
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          
+          # 下载源码计算 HASH
+          wget -q https://github.com/tailscale/tailscale/archive/refs/tags/v${VERSION}.tar.gz -O tailscale.tar.gz
+          HASH=$(sha256sum tailscale.tar.gz | awk '{print $1}')
+          echo "HASH=$HASH" >> $GITHUB_OUTPUT
+          echo "Tailscale 版本: $VERSION"
+          echo "HASH: $HASH"
+
+      - name: 创建 Tailscale Makefile
+        run: |
+          mkdir -p package/network/tailscale/files
+          cat > package/network/tailscale/Makefile << 'EOF'
+          include $(TOPDIR)/rules.mk
+
+          PKG_NAME:=tailscale
+          PKG_VERSION:=${{ steps.tailscale.outputs.VERSION }}
+          PKG_RELEASE:=1
+
+          PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
+          PKG_SOURCE_URL:=https://codeload.github.com/tailscale/tailscale/tar.gz/v$(PKG_VERSION)?
+          PKG_HASH:=${{ steps.tailscale.outputs.HASH }}
+
+          PKG_MAINTAINER:=GitHub Actions
+          PKG_LICENSE:=BSD-3-Clause
+
+          PKG_BUILD_DEPENDS:=golang/host
+          PKG_BUILD_PARALLEL:=1
+          PKG_BUILD_FLAGS:=no-mips16
+
+          GO_PKG:=tailscale.com/cmd/tailscaled
+          GO_PKG_LDFLAGS:=-X 'tailscale.com/version.longStamp=$(PKG_VERSION)-r$(PKG_RELEASE) (ImmortalWrt)'
+          GO_PKG_LDFLAGS_X:=tailscale.com/version.shortStamp=$(PKG_VERSION)
+          GO_PKG_TAGS:=ts_include_cli,ts_omit_aws,ts_omit_bird,ts_omit_completion,ts_omit_kube,ts_omit_systray,ts_omit_taildrop,ts_omit_tap,ts_omit_tpm
+
+          include $(INCLUDE_DIR)/package.mk
+          include $(TOPDIR)/feeds/packages/lang/golang/golang-package.mk
+
+          define Package/tailscale
+            SECTION:=net
+            CATEGORY:=Network
+            SUBMENU:=VPN
+            TITLE:=Zero config VPN
+            URL:=https://tailscale.com
+            DEPENDS:=$(GO_ARCH_DEPENDS) +ca-bundle +kmod-tun
+            PROVIDES:=tailscaled
+          endef
+
+          define Package/tailscale/description
+            Tailscale 零配置 VPN for ImmortalWrt
+          endef
+
+          define Package/tailscale/install
+            $(INSTALL_DIR) $(1)/usr/sbin $(1)/etc/init.d $(1)/etc/config
+            $(INSTALL_BIN) $(GO_PKG_BUILD_BIN_DIR)/tailscaled $(1)/usr/sbin/
+            $(LN) tailscaled $(1)/usr/sbin/tailscale
+            $(INSTALL_BIN) ./files/tailscale.init $(1)/etc/init.d/tailscale
+            $(INSTALL_DATA) ./files/tailscale.conf $(1)/etc/config/tailscale
+          endef
+
+          $(eval $(call BuildPackage,tailscale))
+          EOF
+
+          # 创建 init 脚本
+          cat > package/network/tailscale/files/tailscale.init << 'EOT'
+          #!/bin/sh /etc/rc.common
+          START=99
+          USE_PROCD=1
+
+          start_service() {
+              procd_open_instance
+              procd_set_param command /usr/sbin/tailscaled --state=/etc/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock
+              procd_set_param respawn
+              procd_close_instance
+          }
+          EOT
+
+          chmod +x package/network/tailscale/files/tailscale.init
+
+          # 创建配置文件
+          cat > package/network/tailscale/files/tailscale.conf << 'EOC'
+          config tailscale 'settings'
+              option enabled '0'
+              option port '41641'
+          EOC
+
+      - name: 配置编译
+        run: |
+          make defconfig
+          cat >> .config << EOF
+          CONFIG_TARGET_${{ matrix.target }}=y
+          CONFIG_PACKAGE_tailscale=y
+          CONFIG_PACKAGE_luci-app-tailscale-community=y
+          CONFIG_PACKAGE_luci-i18n-tailscale-community-zh-cn=y
+          EOF
+          make defconfig
+
+      - name: 下载源码
+        run: make -j$(nproc) download V=s || true
+
+      - name: 编译 Tailscale + LuCI
+        run: |
+          make -j$(nproc) package/tailscale/clean package/tailscale/compile V=s
+          make -j$(nproc) package/luci-app-tailscale-community/clean package/luci-app-tailscale-community/compile V=s
+
+      - name: 整理 ipk 文件
+        run: |
+          mkdir -p ./output/${{ matrix.target }}
+          find bin/packages -name "*tailscale*.ipk" -exec cp {} ./output/${{ matrix.target }}/ \;
+          find bin/packages -name "*luci-app-tailscale-community*.ipk" -exec cp {} ./output/${{ matrix.target }}/ \;
+          ls -lh ./output/${{ matrix.target }}/
+
+      - name: 上传编译产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: tailscale-packages-${{ matrix.target }}
+          path: ./output/${{ matrix.target }}/
+          retention-days: 30
