@@ -1,21 +1,16 @@
-name: 完全编译 Tailscale + LuCI (ImmortalWrt v24.10.6)
+name: 编译 Tailscale + LuCI (x86_64 only)
 
 on:
   workflow_dispatch:
     inputs:
       tailscale_version:
-        description: 'Tailscale 版本 (默认 1.98.2)'
+        description: 'Tailscale 版本'
         required: false
         default: '1.98.2'
 
 jobs:
-  build:
-    name: Build for ${{ matrix.target }}
+  build-x86_64:
     runs-on: ubuntu-24.04
-    strategy:
-      matrix:
-        target: [x86_64, aarch64_generic]
-
     steps:
       - name: 检出 ImmortalWrt v24.10.6
         uses: actions/checkout@v4
@@ -24,13 +19,12 @@ jobs:
           ref: v24.10.6
           fetch-depth: 1
 
-      - name: 安装系统依赖
+      - name: 安装编译依赖
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential ccache ecj fastjar file g++ gawk \
-            gettext git java-propose-classpath libelf-dev libncurses5-dev \
-            libncursesw5-dev libssl-dev python3 python3-pip python3-setuptools \
-            python3-dev rsync subversion swig unzip wget zlib1g-dev
+            gettext git libelf-dev libncurses5-dev libncursesw5-dev libssl-dev \
+            python3 python3-pip python3-setuptools rsync subversion swig unzip wget zlib1g-dev
 
       - name: 更新 feeds
         run: |
@@ -49,10 +43,10 @@ jobs:
           wget -q https://codeload.github.com/tailscale/tailscale/tar.gz/v${VERSION} -O tailscale.tar.gz
           HASH=$(sha256sum tailscale.tar.gz | awk '{print $1}')
           echo "HASH=$HASH" >> $GITHUB_OUTPUT
-          echo "使用版本: $VERSION"
+          echo "Tailscale 版本: $VERSION"
           echo "HASH: $HASH"
 
-      - name: 创建 Tailscale 完整 Makefile（严格按你格式）
+      - name: 创建 Tailscale Makefile（严格按你格式）
         run: |
           mkdir -p package/network/tailscale/files
 
@@ -115,63 +109,4 @@ jobs:
           	$(LN) tailscaled $(1)/usr/sbin/tailscale
           	$(INSTALL_BIN) ./files/tailscale.init $(1)/etc/init.d/tailscale
           	$(INSTALL_DATA) ./files/tailscale.conf $(1)/etc/config/tailscale
-          endef
-
-          $(eval $(call BuildPackage,tailscale))
-          EOF
-
-          # 创建 init 脚本
-          cat > package/network/tailscale/files/tailscale.init << 'EOT'
-          #!/bin/sh /etc/rc.common
-          START=99
-          USE_PROCD=1
-
-          start_service() {
-              procd_open_instance
-              procd_set_param command /usr/sbin/tailscaled --state=/etc/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock --port=41641
-              procd_set_param respawn
-              procd_close_instance
-          }
-
-          service_triggers() {
-              procd_add_reload_trigger "tailscale"
-          }
-          EOT
-
-          chmod +x package/network/tailscale/files/tailscale.init
-
-          # 创建配置文件
-          cat > package/network/tailscale/files/tailscale.conf << 'EOC'
-          config tailscale 'settings'
-              option enabled '0'
-              option port '41641'
-          EOC
-
-      - name: 配置并编译
-        run: |
-          make defconfig
-          cat >> .config << EOF
-          CONFIG_TARGET_${{ matrix.target }}=y
-          CONFIG_PACKAGE_tailscale=y
-          CONFIG_PACKAGE_luci-app-tailscale-community=y
-          CONFIG_PACKAGE_luci-i18n-tailscale-community-zh-cn=y
-          EOF
-          make defconfig
-
-          make -j$(nproc) download V=s || true
-          make -j$(nproc) package/tailscale/compile V=s
-          make -j$(nproc) package/luci-app-tailscale-community/compile V=s
-
-      - name: 整理 ipk 文件
-        run: |
-          mkdir -p ./output/${{ matrix.target }}
-          cp -f bin/packages/*/*tailscale*.ipk ./output/${{ matrix.target }}/ 2>/dev/null || true
-          cp -f bin/packages/*/*luci-app-tailscale-community*.ipk ./output/${{ matrix.target }}/ 2>/dev/null || true
-          ls -lh ./output/${{ matrix.target }}/
-
-      - name: 上传编译结果
-        uses: actions/upload-artifact@v4
-        with:
-          name: tailscale-ipks-${{ matrix.target }}
-          path: ./output/${{ matrix.target }}/
-          retention-days: 30
+          end
